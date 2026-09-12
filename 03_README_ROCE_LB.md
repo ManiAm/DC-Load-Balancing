@@ -144,7 +144,7 @@ However, reorder buffers have a fundamental limitation: they are **finite**. The
 
 **Approach 2: True out-of-order placement (eliminate reordering entirely)**
 
-Rather than buffering and reassembling, [MRC](./04_README_MRC.md) makes every packet self-describing — each carries the full RDMA virtual address, so the receiving NIC writes it directly to the correct memory position on arrival, regardless of order. No reorder buffer is needed, no packet is dropped for arriving early, and path diversity is no longer constrained by buffer size.
+Rather than buffering and reassembling, [MRC](https://github.com/ManiAm/DC-AI-MRC) makes every packet self-describing — each carries the full RDMA virtual address, so the receiving NIC writes it directly to the correct memory position on arrival, regardless of order. No reorder buffer is needed, no packet is dropped for arriving early, and path diversity is no longer constrained by buffer size.
 
 ### AR Eligibility Marking (The AR Bit)
 
