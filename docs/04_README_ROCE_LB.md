@@ -99,7 +99,7 @@ Note that "Message Size" on the x-axis is the **AllReduce buffer size**, not a s
 
 The improvement is most pronounced for large buffers where individual RDMA transfers are large enough to become elephant flows that saturate a single link for extended periods. For small buffers (2–8 MB), each transfer completes quickly regardless of path assignment, so distributing them across additional QPs yields little additional throughput.
 
-<img src="./pics/qp-scaling-meta.png" width="550"/>
+<img src="../pics/qp-scaling-meta.png" width="550"/>
 
 QP scaling introduces significant trade-offs:
 
@@ -120,7 +120,7 @@ QP scaling is a pragmatic improvement within the constraints of single-path RC, 
 
 ## Adaptive Routing for RoCEv2
 
-The [Adaptive Routing](./02_README_ARS.md) documentation describes how modern switch ASICs overcome ECMP's congestion blindness by dynamically steering traffic based on real-time port congestion. The two primary algorithms (flowlet switching and packet spraying) apply to RoCEv2 traffic, but the RC ordering constraint changes the calculus significantly.
+The [Adaptive Routing](./03_README_ARS.md) documentation describes how modern switch ASICs overcome ECMP's congestion blindness by dynamically steering traffic based on real-time port congestion. The two primary algorithms (flowlet switching and packet spraying) apply to RoCEv2 traffic, but the RC ordering constraint changes the calculus significantly.
 
 ### Flowlet Switching
 

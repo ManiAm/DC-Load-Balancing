@@ -114,7 +114,7 @@ To balance the need to avoid reordering and the need to maximize link utilizatio
 
 > A flowlet is a burst of packets within a larger flow, separated from the next burst by a brief gap of silence (idle time).
 
-<img src="./pics/flowlet-def.png" alt="segment" width="400">
+<img src="../pics/flowlet-def.png" alt="segment" width="400">
 
 If a flow has been idle long enough that all previously sent packets have successfully reached their destination, there are no packets left "in flight" on the old path. At this point, it is safe to switch the flow to a different path. There is nothing left to arrive out of order.
 
@@ -128,7 +128,7 @@ How long does a gap need to be before the switch considers it safe to move the f
 
 The ideal idle time is based on **path skew** (the maximum difference in latency between any two paths). For example, if Path A takes 5 µs and Path B takes 8 µs, the skew is 3 µs. If you set your idle time to anything greater than 3 µs, you guarantee no reordering.
 
-<img src="./pics/path_skew.png" alt="segment" width="750">
+<img src="../pics/path_skew.png" alt="segment" width="750">
 
 #### How the Algorithm Works (Step-by-Step)
 
@@ -178,7 +178,7 @@ Packet spraying achieves near-perfect load distribution across all links. No sin
 
 As established in the [Packet Reordering Constraint](#the-packet-reordering-constraint), distributing a flow's packets across multiple paths causes out-of-order delivery. Flowlet switching avoids this entirely by only rerouting during idle gaps. Packet-Spray, by contrast, accepts reordering as inevitable and shifts the burden to the **receiving NIC**. Deploying Packet-Spray requires endpoint NICs with dedicated hardware reorder buffers capable of reassembling packets by sequence number at line rate. Without this capability, out-of-order packets would trigger retransmissions and cripple throughput. Modern high-performance NICs (such as NVIDIA ConnectX-7 and AMD Pollara) include this hardware natively.
 
-In mixed environments where some NICs support reordering and others do not, a per-packet signaling mechanism tells the switch whether each packet is safe to spray. For RoCEv2, this is the [AR eligibility bit](./03_README_ROCE_LB.md#ar-eligibility-marking-the-ar-bit) embedded in the InfiniBand BTH header.
+In mixed environments where some NICs support reordering and others do not, a per-packet signaling mechanism tells the switch whether each packet is safe to spray. For RoCEv2, this is the [AR eligibility bit](./04_README_ROCE_LB.md#ar-eligibility-marking-the-ar-bit) embedded in the InfiniBand BTH header.
 
 
 
@@ -271,7 +271,7 @@ Everything discussed so far in this document has been **Local Adaptive Routing**
 
 This creates a critical blind spot. Consider a simple Leaf-Spine fabric:
 
-<img src="./pics/g_adaptive_1.png" alt="segment" width="800">
+<img src="../pics/g_adaptive_1.png" alt="segment" width="800">
 
 In this scenario, Flow 1 (TOR 1 → TOR 3) and Flow 2 (TOR 2 → TOR 3) are both routed through Spine 1. The congestion builds up on the **downlink** between Spine 1 and TOR 3, because both flows are competing for the same egress port on Spine 1.
 
@@ -300,7 +300,7 @@ The ARN mechanism works as follows:
 
 5. **Congestion Resolution:** The traffic load on the Spine 1 → TOR 3 link is reduced. Both spines are now utilized effectively, and the overall fabric throughput improves.
 
-<img src="./pics/g_adaptive_2.png" alt="segment" width="800">
+<img src="../pics/g_adaptive_2.png" alt="segment" width="800">
 
 In larger multi-tier fabrics (3-stage or 5-stage Clos), ARNs can be forwarded through multiple hops, allowing congestion information to propagate all the way back to the ingress leaf where the original path selection is made.
 

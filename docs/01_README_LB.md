@@ -3,7 +3,7 @@
 
 Modern data centers are built on a **Leaf-Spine** topology (a practical implementation of the Clos network architecture). In this design, the network consists of two tiers of switches: **leaf switches** at the edge, where servers connect, and **spine switches** forming the fabric core. The defining characteristic is full-mesh connectivity between the tiers — every leaf switch connects to every spine switch.
 
-<img src="./pics/leaf-spine-new.png" width="480"/>
+<img src="../pics/leaf-spine-new.png" width="480"/>
 
 This full-mesh wiring creates **multiple equal-cost paths** between any two servers on different leaves. Traffic from Server A on Leaf 1 to Server B on Leaf 4 can traverse any of the spine switches and arrive in the same number of hops with the same latency. This inherent path diversity is what gives Leaf-Spine fabrics their bandwidth and resilience — but it also raises a critical question: when a leaf switch has multiple equally valid uplinks, how does it decide which spine to send each packet through?
 
@@ -19,8 +19,8 @@ Before any load balancing can happen, the switch must first discover that multip
 When this happens, the process looks like this:
 
 - The routing protocol identifies multiple equal-cost next hops.
-- It installs all of them into the Forwarding Information Base (FIB).
-- The FIB is actively programmed into the hardware tables of the switching ASIC.
+- It installs all of them into the Routing Information Base (RIB) — the software routing table.
+- The best routes from the RIB are then programmed into the Forwarding Information Base (FIB) — the hardware forwarding tables of the switching ASIC.
 
 While static routes can achieve the same result, dynamic protocols are preferred in production environments. They automatically detect link failures and remove the affected next hop from the hardware tables without manual intervention.
 
@@ -50,19 +50,30 @@ Network flows in a data center generally fall into two categories:
 
 ECMP is the standard data-plane load-balancing mechanism in IP fabrics. It ensures that aggregate traffic is distributed across all available links, while strictly keeping individual flows pinned to a single link.
 
-When a packet arrives, the ASIC extracts the 5-tuple and feeds it into a mathematical hash function implemented directly in the silicon. The resulting hash output is mapped to one of the available equal-cost next hops (often called **buckets**) in the FIB. Because the hash is deterministic, every packet with the same 5-tuple will always produce the exact same hash value, and thus, select the exact same egress port. Different flows produce different hash values, spreading the total load across the fabric.
+The diagram below illustrates ECMP distributing traffic on a per-flow basis. Each colored square represents an individual packet, with each distinct color representing a unique flow. When these packets arrive at the router, the switch sorts each flow into one of the available equal-cost paths. In this example, the router has three available paths, so flows are distributed across three buckets:
 
-<img src="./pics/ecmp_oper.png" width="600"/>
+- Pink Flow: Pinned to the top path.
+- Blue Flow: Pinned to the middle path.
+- Orange & Green Flows: Both routed across the bottom path.
 
-As illustrated in the diagram below, ECMP distributes traffic on a per-flow basis. Each colored square represents an individual packet, with each distinct color representing a unique flow. When these packets arrive at the router, the ASIC extracts the 5-tuple and runs the hash. Because this router has three available paths (a next-hop group of size three), the hash output is calculated modulo 3, sorting the flows into three distinct buckets:
+<img src="../pics/ecmp_example.png" width="650"/>
 
-- Pink Flow: Yields a specific hash remainder and is pinned to the top path.
-- Blue Flow: Yields a different hash remainder and is pinned to the middle path.
-- Orange & Green Flows: Yield the exact same hash remainder and are routed across the bottom path.
+The Orange and Green flows sharing the same path is an example of a **hash collision**. Because there are nearly infinite flow combinations but only a few physical links, different flows will inevitably map to the same link.
 
-<img src="./pics/ecmp_example.png" width="650"/>
 
-The Orange and Green flows demonstrate a standard hash collision. Because there are nearly infinite flow combinations but only a few physical links, different flows will inevitably compute to the same remainder and share a physical link.
+### Hash-Based Forwarding
+
+To understand how the ASIC picks a path, follow one packet through the switch:
+
+- **Step 1**: Packet arrives; the ASIC extracts the destination IP.
+- **Step 2**: Routing table (FIB) lookup → the route points to a next-hop group (NHG) with multiple equal-cost members.
+- **Step 3**: The ASIC extracts the 5-tuple and computes a hash over it (the hash output is a wide number, e.g. `0x9C41`).
+- **Step 4**: The hash is reduced to a bucket index: `index = hash mod NHG_size` (e.g. `0x9C41 mod 4 = 1`).
+- **Step 5**: A lookup table (**bucket array**) is read at that index. The entry (**bucket**) points to a specific member (next hop, MAC, egress port).
+
+The one line to remember: **the hash picks an index; the bucket at that index picks the member.**
+
+<img src="../pics/ecmp_oper.png" width="800"/>
 
 > **Note:** ECMP hashing does not track how many packets or how much bandwidth has been sent to each next hop. It provides no guarantee that traffic is evenly distributed across all links. Distribution is purely statistical — it depends on the number and size of active flows and how their headers happen to hash. With a large number of **mice flows**, distribution tends to be even. With a small number of **elephant flows** or flows with similar headers, significant imbalance is possible. See [The Elephant Flow Problem](#the-elephant-flow-problem) for a detailed analysis.
 
@@ -87,7 +98,7 @@ Operators can enable or disable individual fields to solve specific network chal
 
 In a standard 2-tier fabric, the leaf switch is the primary device performing ECMP, choosing which spine to send traffic to. The spine typically has exactly one direct link to each destination leaf, so it simply forwards the packet without needing to load-balance. However, in a larger 3-tier fabric (leaf → spine → super-spine), the spine ASICs will also perform ECMP when selecting which super-spine to traverse to reach a completely different pod.
 
-<img src="./pics/ecmp_leaf_spine.png" alt="segment" width="400">
+<img src="../pics/ecmp_leaf_spine.png" alt="segment" width="400">
 
 This asymmetry has a powerful scaling implication: adding a new spine switch to the fabric instantly adds one more ECMP bucket to *every* leaf in the fabric simultaneously. If a leaf previously had 4 spines (4 equal-cost paths), adding a 5th spine gives every leaf a 5th path, increasing total fabric bandwidth by 25% without touching a single existing switch configuration. This is one of the reasons Leaf-Spine scales predictably: bandwidth is a function of spine count, and ECMP distributes it automatically.
 
@@ -100,7 +111,7 @@ In a multi-tier topology, each switch independently computes its own ECMP hash o
 
 The following diagram illustrates hash polarization. Consider four flows (F1–F4), each with a different 5-tuple, arriving at Switch A:
 
-<img src="./pics/hash-pol.png" alt="segment" width="500">
+<img src="../pics/hash-pol.png" alt="segment" width="500">
 
 Switch A computes a hash on each flow's 5-tuple to select a next hop. According to the first hash table in the diagram, flows that hash to 0 are forwarded to Switch B (green dashed path) and flows that hash to 1 are forwarded to Switch C (red dashed path). Suppose F1 and F2 hash to 0, while F3 and F4 hash to 1. So far, the traffic is successfully split.
 
@@ -158,95 +169,6 @@ Deployment Recommendations:
 - Avoid `random` and `round-robin` unless the application specifically tolerates packet reordering.
 
 
-### The Disruption Problem
-
-In static ECMP, the number of buckets exactly equals the number of active next-hops, and each next-hop owns exactly one bucket.
-
-<img src="./pics/1.png" alt="segment" width="350">
-
-This means any membership change forces a complete rebuild of the hash-to-bucket mapping.
-
-**Addition**: When a new next-hop is added (e.g., Server E joins), the bucket count increases and the hash modulus changes. The ASIC recalculates the mapping for all flows, not just the ones that will use the new path. Flows that were stable on their existing paths get reassigned to different next-hops, causing out-of-order packets.
-
-<img src="./pics/2.png" alt="segment" width="350">
-
-**Removal**: The same reshuffling occurs when a next-hop fails or is withdrawn. For example, when Server B fails, its bucket is removed and the total shrinks from four to three. The hash recalculation disrupts all remaining flows including those that had no relationship to Server B.
-
-<img src="./pics/3.png" alt="segment" width="750">
-
-
-#### The Partial Fix — Consistent Hashing
-
-To fix the reshuffling caused by static ECMP, engineers introduced Consistent Hashing. Consistent hashing decouples the number of buckets from the number of next-hops by creating a fixed-size container. Instead of having exactly 4 buckets for 4 servers, the switch might be configured with a fixed pool of 12 buckets, which are dealt out evenly (e.g., 3 buckets per server).
-
-When an ECMP member fails or is removed, the number of hash buckets does not shrink. Instead, the specific buckets that belonged to the dead member are redistributed to the surviving next-hops.
-
-- Advantage: All other flows remain completely undisturbed.
-- Drawback: It does not prevent disruption when a new next-hop is added, as space must be cleared for the new member.
-
-The following figure shows next-hops assigned in a round-robin fashion to a fixed, larger pool of buckets.
-
-<img src="./pics/5.png" alt="segment" width="350">
-
-Because the number of buckets is fixed, removing a next-hop no longer changes the math for the entire group. When Next-Hop B fails, the total number of buckets (12) does not change.
-
-<img src="./pics/6.png" alt="segment" width="350">
-
-The system only takes the specific buckets mapped to the failed node and redistributes them to surviving next-hops. Healthy flows remain completely undisturbed.
-
-<img src="./pics/7.png" alt="segment" width="350">
-
-
-#### The Complete Solution — Resilient Hashing
-
-Consistent Hashing eliminates disruption on member removal (surviving flows are undisturbed), but it does not handle member additions gracefully. Because the bucket count is fixed, adding a new next-hop means stealing buckets from existing next-hops to give to the new one, which can still disrupt active flows. The following figures show adding Next-Hop E requires shifting some existing buckets (3 and 8) to make room, which can disrupt active sessions.
-
-<img src="./pics/8.png" alt="segment" width="750">
-
-Resilient Hashing builds directly upon Consistent Hashing to solve the final puzzle piece: how to add a new server gracefully without breaking active sessions. It uses the same fixed-size bucket pool, but instead of immediately stealing buckets when a new node is added, it introduces patience. The core idea is:
-
-1. The new next-hop is brought online but initially receives **zero buckets**.
-2. The switch monitors which existing buckets are currently carrying active traffic and which are idle.
-3. When a bucket goes idle (no recent traffic detected), the switch safely migrates that empty bucket to the new next-hop.
-4. Active sessions are protected and allowed to naturally conclude on their original paths, while new traffic gradually begins balancing onto the new node.
-
-This concept is universal to resilient hashing, but the specific implementation differs by ASIC vendor:
-
-##### Broadcom (Immediate Redistribution)
-
-On Broadcom ASICs (Tomahawk, Trident series), resilient hashing operates without timers or background monitoring:
-- When a next-hop is **removed**, its buckets are immediately redistributed to the surviving next-hops.
-- When a next-hop is **added**, some buckets are immediately migrated from existing next-hops to the new one.
-- The algorithm balances buckets as evenly as possible across all next-hops. Assignment does not change for any reason other than membership changes (it does not react to traffic load or bucket activity).
-
-This is simple and deterministic, but the immediate migration on addition can disrupt active flows that happen to occupy the stolen buckets.
-
-##### Nvidia / Mellanox Spectrum (Timer-based, Gradual)
-
-On Nvidia Spectrum ASICs, a background thread manages bucket migration using two configurable timers:
-- `active_flow_timer`: Defines how long a bucket must be continuously idle (no traffic) before it is considered safe to migrate. The default is typically 120 seconds.
-- `max_unbalanced_timer`: A hard ceiling on how long the system is allowed to remain unbalanced. If this timer expires and there are still not enough idle buckets, the switch forces a migration as a safety net.
-
-The step-by-step process:
-1. A new next-hop is added. It receives zero buckets.
-2. The background thread continuously scans all buckets for activity.
-3. When a bucket has been idle for the full `active_flow_timer` duration, it is migrated to the new next-hop.
-4. If the `max_unbalanced_timer` expires before enough idle buckets are found, the thread forces a rebalance (which may disrupt active sessions).
-
-This timer-based approach protects long-lived sessions from disruption during scale-out events, at the cost of temporarily uneven distribution until buckets naturally become idle. In networks with highly persistent flows, the new next-hop may remain underutilized for an extended period.
-
-##### Bucket Count Trade-offs
-
-Resilient hashing uses a finite, hardware-level pool of buckets that is shared across all ECMP groups on the switch. The number of buckets per ECMP group is configurable (common options: 64, 128, 256, 512, or 1024), and this choice represents a direct trade-off:
-
-- **More buckets per group:** Reduces the disruption impact when a next-hop is added or removed (a smaller percentage of flows are affected). However, the total number of ECMP groups the switch can support decreases because the shared hardware pool is consumed faster.
-
-- **Fewer buckets per group:** Supports more ECMP groups simultaneously, but each add/remove event disrupts a larger proportion of flows.
-
-If the maximum number of ECMP groups is reached, new ECMP routes cannot be installed and are rejected by the hardware.
-
-
-
 ## The Elephant Flow Problem
 
 ECMP was designed around the "law of large numbers." It assumes that hashing thousands of random, small flows (Mice) will naturally and evenly distribute traffic across all available links. For Mice flows, this statistical assumption works perfectly. However, because ECMP is strictly bound by the rule that it cannot split a single flow across multiple paths (to preserve packet ordering), an entire Elephant flow is forced to traverse a single physical link.
@@ -265,7 +187,7 @@ While that single link is completely overwhelmed and dropping traffic, neighbori
 
 The diagram below shows a concrete hash collision in an 8-leaf, 4-spine fabric. Two independent elephant flows happen to hash to the same spine, congesting a single downlink while parallel paths sit idle.
 
-<img src="./pics/ecmp_collision.jpg" alt="ECMP hash collision" width="900">
+<img src="../pics/ecmp_collision.jpg" alt="ECMP hash collision" width="900">
 
 Server 2 (on leaf 1) is sending a large flow to server 9 (on leaf 3). Leaf 1's ASIC hashes the flow's 5-tuple and selects spine 2 as the next hop. The green path (server 2 → leaf 1 → spine 2 → leaf 3 → server 9) carries this flow without issue.
 
@@ -303,37 +225,13 @@ For a leaf switch with *K* = 8 spine uplinks and *N* = 32 active elephant flows:
 The most congested spine link is expected to carry **10 flows** (2.5× its fair share) while lightly loaded links sit underutilized. This imbalance costs the fabric approximately 10–15% in total throughput, even though aggregate capacity is more than sufficient.
 
 
-## Weighted ECMP
-
-We assumed so far that all paths in an ECMP group are **equal** — same link speed, same capacity, same share of the hash space. **Weighted ECMP** removes this assumption by allowing each next hop to receive a **proportional** share of traffic based on an assigned weight.
-
-> The industry has not settled on a single name. Cumulus Linux (Nvidia) and Nokia use **Weighted ECMP**; SONiC, Google, and SAI use **WCMP** (Weighted Cost Multipath); Cisco and Juniper use **UCMP** (Unequal Cost Multipath). **BGP Link Bandwidth** is the BGP extended community that signals per-path capacity to derive weights. The underlying mechanism is the same in all cases.
-
-### Why It Is Needed
-
-Consider a fabric with **heterogeneous link speeds** — for example, during a rolling upgrade from 40G to 100G. If a leaf has one 100G uplink to Spine A and one 40G uplink to Spine B, standard ECMP splits flows 50/50. The 40G link saturates while the 100G link sits underutilized. Weighted ECMP allows the operator to assign weights (e.g., 5:2) that match the capacity ratio, steering approximately 71% of flows toward the faster link. It is also used for **traffic engineering** — deliberately directing more traffic toward a specific path, even when link speeds are identical.
-
-### How Weights Are Implemented in Hardware
-
-Weighted ECMP uses the same hash-and-bucket mechanism as standard ECMP. The only difference is how buckets are allocated. In standard ECMP with 3 next hops and 12 buckets, each next hop owns exactly 4. In weighted ECMP, a next hop with higher weight owns **more buckets**.
-
-The most common hardware technique is **entry replication**: the same physical next hop is listed multiple times in the next-hop group. The hash function is unchanged (it still maps flows to buckets uniformly) but because a heavier next hop occupies more buckets, it statistically receives more flows:
-
-    Standard ECMP (equal):           [A] [B] [C] [A] [B] [C] [A] [B] [C]
-    Weighted ECMP (3:1:1 weight):    [A] [A] [A] [B] [C] [A] [A] [A] [B] [C]
-
-### Limitations
-
-Weighted ECMP inherits the same fundamental constraint as standard ECMP: each flow is pinned to a single bucket and **cannot be split**. The configured weight ratio only holds statistically when there are many small mice flows. A small number of elephant flows can easily skew the actual load far from the intended weights.
-
-Additionally, weighted ECMP complicates [resilient hashing](#the-complete-solution--resilient-hashing). When a next-hop group is resized, redistributing replicated entries can inadvertently alter the intended weight ratio — a problem known as **weight skew**.
-
-
 ## Centralized Traffic Engineering (The SDN Approach)
 
 ### The Fundamental Limitation of ECMP
 
-Every mechanism discussed in this document — hash tuning, polarization mitigation, resilient hashing, weighted ECMP — improves ECMP but cannot escape its core constraint: **the switch makes forwarding decisions using only local information**. Each switch hashes packet headers and selects a bucket independently, with no knowledge of how much traffic other switches are placing on the same links. When multiple leaf switches independently hash elephant flows onto the same spine link, the result is congestion on that link while parallel links sit idle — and no individual switch can detect or correct this because each one sees only its own egress ports.
+Every mechanism discussed so far — hash tuning, polarization mitigation — improves ECMP but cannot escape its core constraint: **the switch makes forwarding decisions using only local information**. Each switch hashes packet headers and selects a bucket independently, with no knowledge of how much traffic other switches are placing on the same links. When multiple leaf switches independently hash elephant flows onto the same spine link, the result is congestion on that link while parallel links sit idle — and no individual switch can detect or correct this because each one sees only its own egress ports.
+
+> For mechanisms that address ECMP's disruption and weighting limitations — resilient hashing, consistent hashing, and weighted ECMP — see [ECMP Variants](02_ECMP_VAR.md).
 
 This is not a configuration problem. It is an architectural limitation of any system where forwarding decisions are made independently at each hop using only locally available information.
 
@@ -353,7 +251,7 @@ MicroTE operates in three phases:
 
 MicroTE focuses its optimization on the **predictable** portion of traffic (large, stable [elephant flows](#the-elephant-flow-problem)). Short-lived [mice flows](#what-is-a-network-flow) change too rapidly for a centralized system to track, so they are left to standard ECMP, where their small size means hash collisions cause negligible harm.
 
-<img src="./pics/microTE.png" alt="segment" width="400">
+<img src="../pics/microTE.png" alt="segment" width="400">
 
 
 ### ECMP vs. Centralized TE
