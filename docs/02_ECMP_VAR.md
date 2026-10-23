@@ -10,11 +10,15 @@ In static ECMP, the number of buckets exactly equals the number of active next-h
 
 This means any membership change forces a complete rebuild of the hash-to-bucket mapping.
 
-**Addition**: When a new next-hop is added (e.g., Server E joins), the bucket count increases and the hash modulus changes. The ASIC recalculates the mapping for all flows, not just the ones that will use the new path. Flows that were stable on their existing paths get reassigned to different next-hops, causing out-of-order packets.
+### Addition
+
+When a new next-hop is added (e.g., Server E joins), the bucket count increases and the hash modulus changes. The ASIC recalculates the mapping for all flows, not just the ones that will use the new path. Flows that were stable on their existing paths get reassigned to different next-hops, causing out-of-order packets.
 
 <img src="../pics/2.png" alt="segment" width="350">
 
-**Removal**: The same reshuffling occurs when a next-hop fails or is withdrawn. For example, when Server B fails, its bucket is removed and the total shrinks from four to three. The hash recalculation disrupts all remaining flows including those that had no relationship to Server B.
+### Removal
+
+The same reshuffling occurs when a next-hop fails or is withdrawn. For example, when Server B fails, its bucket is removed and the total shrinks from four to three. The hash recalculation disrupts all remaining flows including those that had no relationship to Server B.
 
 <img src="../pics/3.png" alt="segment" width="750">
 
@@ -25,10 +29,7 @@ To fix the reshuffling caused by static ECMP, engineers introduced Consistent Ha
 
 When an ECMP member fails or is removed, the number of hash buckets does not shrink. Instead, the specific buckets that belonged to the dead member are redistributed to the surviving next-hops.
 
-- Advantage: All other flows remain completely undisturbed.
-- Drawback: It does not prevent disruption when a new next-hop is added, as space must be cleared for the new member.
-
-The following figure shows next-hops assigned in a round-robin fashion to a fixed, larger pool of buckets.
+The following figure shows 4 next-hops assigned in a round-robin fashion to a fixed pool of 12 buckets — 3 buckets per next-hop.
 
 <img src="../pics/5.png" alt="segment" width="350">
 
@@ -40,21 +41,13 @@ The system only takes the specific buckets mapped to the failed node and redistr
 
 <img src="../pics/7.png" alt="segment" width="350">
 
-
-### The Complete Solution — Resilient Hashing
-
-Consistent Hashing eliminates disruption on member removal (surviving flows are undisturbed), but it does not handle member additions gracefully. Because the bucket count is fixed, adding a new next-hop means stealing buckets from existing next-hops to give to the new one, which can still disrupt active flows. The following figures show adding Next-Hop E requires shifting some existing buckets (3 and 8) to make room, which can disrupt active sessions.
+However, consistent hashing does not prevent disruption when a new next-hop is added. Because the bucket count is fixed, adding a new next-hop means stealing buckets from existing next-hops to give to the new one, which can still disrupt active flows. The following figure shows adding Next-Hop E requires shifting some existing buckets (3 and 8) to make room, which can disrupt active sessions.
 
 <img src="../pics/8.png" alt="segment" width="750">
 
-Resilient Hashing builds directly upon Consistent Hashing to solve the final puzzle piece: how to add a new server gracefully without breaking active sessions. It uses the same fixed-size bucket pool, but instead of immediately stealing buckets when a new node is added, it introduces patience. The core idea is:
+### The Complete Solution — Resilient Hashing
 
-1. The new next-hop is brought online but initially receives **zero buckets**.
-2. The switch monitors which existing buckets are currently carrying active traffic and which are idle.
-3. When a bucket goes idle (no recent traffic detected), the switch safely migrates that empty bucket to the new next-hop.
-4. Active sessions are protected and allowed to naturally conclude on their original paths, while new traffic gradually begins balancing onto the new node.
-
-This concept is universal to resilient hashing, but the specific implementation differs by ASIC vendor:
+Resilient Hashing builds directly upon Consistent Hashing to solve the final puzzle piece: how to add a new server gracefully without breaking active sessions. It uses the same fixed-size bucket pool, but adds intelligence to how buckets are reassigned during membership changes, minimizing disruption to active flows. The specific implementation differs by ASIC vendor:
 
 #### Broadcom (Immediate Redistribution)
 
@@ -90,84 +83,124 @@ Resilient hashing uses a finite, hardware-level pool of buckets that is shared a
 If the maximum number of ECMP groups is reached, new ECMP routes cannot be installed and are rejected by the hardware.
 
 
-
 ## Fine-Grained ECMP
 
-Consistent hashing and resilient hashing solve the disruption problem in hardware, but their bucket redistribution is coarse — they have no awareness of which upstream router a next hop belongs to, so a failure behind one spine can still reshuffle flows destined for a completely different spine.
+Consistent hashing and resilient hashing solve the disruption problem in hardware, but their bucket redistribution is **topology-unaware**. The ASIC treats all next-hops as interchangeable — it has no knowledge of which upstream router each next-hop traverses.
 
-**Fine-Grained ECMP (FG-ECMP)** takes a different approach: instead of letting the ASIC manage the bucket array, **software pre-computes the entire bucket-to-member mapping** and programs it explicitly. The ASIC itself just sees a regular ECMP group with a pre-populated bucket array — all the "fine-grained" intelligence lives in the control plane.
+To see why this matters, consider the following 2-Leaf, 2-Spine Clos fabric. Each leaf connects to each spine with 2 links, so Leaf-1 has 4 ECMP next-hops to reach any destination behind Leaf-2.
 
-This software ownership enables two capabilities that hardware-managed modes cannot provide on their own:
+<img src="../pics/clos-fg-ecmp.png" alt="segment" width="550">
+
+From Leaf-1's perspective, its ECMP group has 4 members: 2 links via Spine-1 and 2 links via Spine-2. Using 12 buckets (3 per link), the initial state is:
+
+```text
+Initial State (12 buckets, 4 links)
+
+    Bucket  0 → Spine-1 Link-A   ┐
+    Bucket  1 → Spine-1 Link-A   ├─ Spine-1 (25%)
+    Bucket  2 → Spine-1 Link-A   ┘
+    Bucket  3 → Spine-1 Link-B   ┐
+    Bucket  4 → Spine-1 Link-B   ├─ Spine-1 (25%)
+    Bucket  5 → Spine-1 Link-B   ┘
+    Bucket  6 → Spine-2 Link-C   ┐
+    Bucket  7 → Spine-2 Link-C   ├─ Spine-2 (25%)
+    Bucket  8 → Spine-2 Link-C   ┘
+    Bucket  9 → Spine-2 Link-D   ┐
+    Bucket 10 → Spine-2 Link-D   ├─ Spine-2 (25%)
+    Bucket 11 → Spine-2 Link-D   ┘
+
+    Spine-1 total: 50%    Spine-2 total: 50%    ✓ Balanced
+```
+
+Now suppose **Link-A fails**. Here is how each approach redistributes its 3 orphaned buckets:
+
+```text
+Without Topology Awareness (consistent/resilient hashing)
+
+    Leaf-1's ASIC spreads Link-A's buckets equally across ALL 3 survivors:
+
+    Bucket  0 → Spine-1 Link-B   ◄ was Link-A
+    Bucket  1 → Spine-2 Link-C   ◄ was Link-A
+    Bucket  2 → Spine-2 Link-D   ◄ was Link-A
+    Bucket  3 → Spine-1 Link-B
+    Bucket  4 → Spine-1 Link-B
+    Bucket  5 → Spine-1 Link-B
+    Bucket  6 → Spine-2 Link-C
+    Bucket  7 → Spine-2 Link-C
+    Bucket  8 → Spine-2 Link-C
+    Bucket  9 → Spine-2 Link-D
+    Bucket 10 → Spine-2 Link-D
+    Bucket 11 → Spine-2 Link-D
+
+    Link-B: 4 buckets    Link-C: 4 buckets    Link-D: 4 buckets
+    Spine-1 total: 33%   Spine-2 total: 67%   ✗ Unbalanced
+```
+
+```text
+With Topology Awareness (fine-grained ECMP)
+
+    Software redistributes Link-A's buckets ONLY to Link-B (same spine):
+
+    Bucket  0 → Spine-1 Link-B   ◄ was Link-A
+    Bucket  1 → Spine-1 Link-B   ◄ was Link-A
+    Bucket  2 → Spine-1 Link-B   ◄ was Link-A
+    Bucket  3 → Spine-1 Link-B
+    Bucket  4 → Spine-1 Link-B
+    Bucket  5 → Spine-1 Link-B
+    Bucket  6 → Spine-2 Link-C
+    Bucket  7 → Spine-2 Link-C
+    Bucket  8 → Spine-2 Link-C
+    Bucket  9 → Spine-2 Link-D
+    Bucket 10 → Spine-2 Link-D
+    Bucket 11 → Spine-2 Link-D
+
+    Link-B: 6 buckets    Link-C: 3 buckets    Link-D: 3 buckets
+    Spine-1 total: 50%   Spine-2 total: 50%   ✓ Balanced
+```
+
+Without topology awareness, Leaf-1's ASIC sees four flat, interchangeable members with no grouping information. Two-thirds of all traffic now takes the Spine-2 path, overloading it while Spine-1 is underutilized.
+
+The second diagram is what **Fine-Grained ECMP (FG-ECMP)** makes possible. Instead of letting the ASIC manage the bucket array, software pre-computes the entire bucket-to-member mapping and programs it explicitly. The ASIC itself just sees a regular ECMP group with a pre-populated bucket array — all the "fine-grained" intelligence lives in the control plane. Because software knows which links share a spine, it can restrict redistribution to the correct subset of survivors and keep the per-spine traffic ratio intact.
+
+This software ownership enables two key capabilities:
 
 1. **Keep the bucket array size constant** when a member disappears (no modulus change, no global rehash).
 
 2. **Rewrite only the specific buckets** that belonged to the failed member — and restrict that rewrite to a chosen subset of survivors.
 
-### How It Works
-
-The key difference from standard ECMP is the bucket count. In standard ECMP, the bucket count equals the member count (3 members = 3 buckets). In FG-ECMP, the operator configures a **much larger, fixed bucket pool** (e.g. 30 buckets for 3 members). Each member receives an equal share (10 buckets each). The larger count gives finer granularity for redistribution on failures.
-
-```text
-Standard ECMP (3 next hops, 3 buckets):
-
-    Bucket 0 → NH-A    ┐
-    Bucket 1 → NH-B    ├─ ASIC decides; removal of NH-B rehashes ALL flows
-    Bucket 2 → NH-C    ┘
-
-Fine-Grained ECMP (3 next hops, 30 buckets):
-
-    Bucket  0–9  → NH-A   ┐
-    Bucket 10–19 → NH-B   ├─ Software decides (10 buckets per NH)
-    Bucket 20–29 → NH-C   ┘
-```
-
-When NH-B fails, the software rewrites only buckets 10–19 and redistributes them to the surviving members. The array size stays at 30, so the hash modulus (`h mod 30`) does not change. Flows on NH-A and NH-C stay exactly where they were:
-
-```text
-Before NH-B fails                           After NH-B fails (only buckets 10–19 rewritten)
-
-  Bucket  0–9   → NH-A                         Bucket  0–9   → NH-A      unchanged
-  Bucket 10–19  → NH-B                         Bucket 10–19  → NH-A/NH-C rewritten
-  Bucket 20–29  → NH-C                         Bucket 20–29  → NH-C      unchanged
-
-  h mod 30                                     h mod 30   (array size unchanged)
-```
-
-With standard ECMP, the same failure shrinks the array from 3 to 2 buckets, changes the modulus, and moves nearly every flow. With FG-ECMP, only the dead member's flows must move — everyone else is untouched.
-
 ### Banks: Limiting the Blast Radius
 
-The above example redistributed NH-B's buckets to *all* survivors. FG-ECMP can do better using **banks** — a grouping of next hops that share a common property, typically one bank per upstream router or spine.
+The topology-aware example above redistributed Link-A's buckets only to Link-B — the other link on the same spine. FG-ECMP formalizes this grouping with **banks** — a label that ties next-hops together by a common property, typically one bank per upstream spine.
 
 A bank is a label attached to each member. Members that share a label form a bank, and each bank owns a contiguous range of the bucket array, sized in proportion to its member count. The critical rule: **when a member fails, its buckets are given only to other members in the same bank.** Members in other banks receive nothing — their bucket ranges, their flows, and their traffic load are all untouched.
 
-Example: 60 buckets, three next hops, two banks (one per upstream spine):
+Using the same 12-bucket example from above, the two spines become two banks:
 
 ```text
-Fine-Grained ECMP (3 next hops, 60 buckets, 2 banks):
+Fine-Grained ECMP (4 links, 12 buckets, 2 banks):
 
-  bank 0 = { NH-1, NH-3 }   owns buckets  0–39   (20 per member)
-  bank 1 = { NH-5 }         owns buckets 40–59   (20 per member)
+  Bank 0 (Spine-1) = { Link-A, Link-B }   owns buckets 0–5    (3 per link)
+  Bank 1 (Spine-2) = { Link-C, Link-D }   owns buckets 6–11   (3 per link)
 
-  NH-3 fails  →  buckets 20–39 are rewritten to NH-1 (same bank)
-                 buckets 40–59 (bank 1) are not touched
+  Link-A fails  →  buckets 0–2 are rewritten to Link-B (same bank)
+                   buckets 6–11 (Bank 1) are not touched
 ```
 
-A failure behind Spine 1 cannot ripple into traffic that was going through Spine 2. This is **bank-scoped failover** — the core value of FG-ECMP.
+A failure behind Spine-1 cannot ripple into traffic that was going through Spine-2. This is **bank-scoped failover** — the core value of FG-ECMP.
 
-> **Note:** Banks are a failover isolation concept, not a traffic-weighting concept. Every member still receives the same number of buckets (`total_buckets / total_members`). A bank's range is larger only because it has more members. With 60 buckets and 3 members, each member gets exactly 20 buckets (33.3% of traffic) — bank 0 owns 40 buckets because it has two members, not because it has higher weight.
+> Banks are a failover isolation concept, not a traffic-weighting concept. Every member still receives the same number of buckets (`total_buckets / total_members`). In our example, with 12 buckets and 4 links, each link gets exactly 3 buckets (25% of traffic). Each bank owns 6 buckets because it has two members, not because it has higher weight.
 
 ### FG-ECMP vs. Standard and Consistent ECMP
 
-| Property                 | Fine-Grained ECMP                        | Static ECMP         | Consistent ECMP |
-|--------------------------|------------------------------------------|---------------------|-----------------|
-| **Bucket management**    | Software-controlled                      | Hardware (ASIC)     | Hardware (ASIC) |
-| **Bucket assignment**    | Explicitly programmed per bucket         | ASIC-managed        | ASIC-managed |
-| **Bucket count**         | Fixed (operator-configured)              | Equals member count | Fixed (pre-configured) |
-| **Traffic distribution** | Equal per next hop                       | Equal per next hop  | Equal per next hop |
-| **Stable on removal**    | Yes (bank-scoped redistribution)         | No (full rehash)    | Yes (hardware) |
-| **Stable on addition**   | Partial (proportional steal within bank) | No (full rehash)    | No (bucket steal) |
-| **Bank-based failover**  | Yes                                      | No                  | No                |
+| Property                 | Static ECMP         | Consistent ECMP        | Fine-Grained ECMP                        |
+|--------------------------|---------------------|------------------------|------------------------------------------|
+| **Bucket management**    | Hardware (ASIC)     | Hardware (ASIC)        | Software-controlled                      |
+| **Bucket assignment**    | ASIC-managed        | ASIC-managed           | Explicitly programmed per bucket         |
+| **Bucket count**         | Equals member count | Fixed (pre-configured) | Fixed (operator-configured)              |
+| **Traffic distribution** | Equal per next hop  | Equal per next hop     | Equal per next hop                       |
+| **Stable on removal**    | No (full rehash)    | Yes (hardware)         | Yes (bank-scoped redistribution)         |
+| **Stable on addition**   | No (full rehash)    | No (bucket steal)      | Partial (proportional steal within bank) |
+| **Bank-based failover**  | No                  | No                     | Yes                                      |
 
 Two things to remember about FG-ECMP:
 
@@ -179,7 +212,7 @@ Two things to remember about FG-ECMP:
 
 Everything covered so far splits traffic **equally** across next hops. **Weighted ECMP** removes this assumption by allowing each next hop to receive a **proportional** share of traffic based on an assigned weight.
 
-> The industry has not settled on a single name. Cumulus Linux (Nvidia) and Nokia use **Weighted ECMP**; SONiC, Google, and SAI use **WCMP** (Weighted Cost Multipath); Cisco and Juniper use **UCMP** (Unequal Cost Multipath). **BGP Link Bandwidth** is the BGP extended community that signals per-path capacity to derive weights. The underlying mechanism is the same in all cases.
+> The industry has not settled on a single name. Cumulus Linux (Nvidia) and Nokia use **Weighted ECMP**; SONiC, Google, and SAI use **WCMP** (Weighted Cost Multipath); Cisco and Juniper use **UCMP** (Unequal Cost Multipath). The underlying mechanism is the same in all cases.
 
 ### Why It Is Needed
 
@@ -191,7 +224,7 @@ Standard ECMP gives every next hop an equal share of the hash space. That is the
 
 ### How Weights Are Implemented in Hardware
 
-The weight is a **per-member attribute** — it lives on each next hop *inside* the group, not on the route and not on the group itself. Weighted ECMP uses the exact same hash-and-bucket mechanism as standard ECMP. The hash function is unchanged, and a given flow still sticks to exactly one next hop. The only difference is **how buckets are allocated**: a next hop with higher weight owns more buckets.
+The weight is a **per-member attribute** — it lives on each member inside the group, not on the next hop, the route, or the group itself. Weighted ECMP uses the exact same hash-and-bucket mechanism as standard ECMP. The hash function is unchanged, and a given flow still sticks to exactly one next hop. The only difference is **how buckets are allocated**: a next hop with higher weight owns more buckets.
 
 In standard ECMP, the bucket count equals the member count — one bucket per member. In weighted ECMP, the bucket count is the **sum of the weights**, and each member owns buckets proportional to its weight. The most common hardware technique is **entry replication**: the same physical next hop is listed multiple times in the bucket array.
 
@@ -201,7 +234,6 @@ Take four members and give NH-A weight 2 while the others keep weight 1. The buc
                                           ┌─ Next Hop Group ──────────────────────────────────────┐
                                           │                                                       │
                                           │   Hash Buckets          Members                       │
-                                          │   (bucket array)        (next hops, with weight)      │
                                           │  ┌─────────────┐      ┌───────────────────────────┐   │
   flow 1 ──────┐                          │  │  Bucket 0   │ ──┐  │ #0  NH-A  Eth0   weight 2 │   │
                │    ┌────────┐            │  ├─────────────┤   ├─►│      (2 of 5 buckets)     │   │
@@ -222,7 +254,7 @@ Take four members and give NH-A weight 2 while the others keep weight 1. The buc
 
 Because each bucket still attracts an equal share of flows (`1/num_buckets`), the hash itself never changes — only the bucket-to-member ownership changes, and that is what shapes the traffic split.
 
-Weights are **ratios**: 2:1:1:1 and 4:2:2:2 produce the same 40/20/20/20 split, just with 5 or 10 buckets. When the summed weights get large, the ASIC may rescale them to a smaller total while preserving the same ratio. Standard ECMP is simply the special case where every weight is 1, so bucket count equals member count.
+Weights are **ratios**: 2:1:1:1 and 4:2:2:2 produce the same 40/20/20/20 split, just with 5 or 10 buckets. When the summed weights get large, the ASIC may perform **weight normalization** — rescaling them to a smaller total while preserving the same ratio. Standard ECMP is simply the special case where every weight is 1, so bucket count equals member count.
 
 ### Weight Sources
 

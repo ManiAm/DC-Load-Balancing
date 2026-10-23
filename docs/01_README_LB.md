@@ -22,9 +22,11 @@ When this happens, the process looks like this:
 - It installs all of them into the Routing Information Base (RIB) — the software routing table.
 - The best routes from the RIB are then programmed into the Forwarding Information Base (FIB) — the hardware forwarding tables of the switching ASIC.
 
-While static routes can achieve the same result, dynamic protocols are preferred in production environments. They automatically detect link failures and remove the affected next hop from the hardware tables without manual intervention.
+> While static routes can achieve the same result, dynamic protocols are preferred in production environments. They automatically detect link failures and remove the affected next hop from the hardware tables without manual intervention.
 
 Once the FIB is programmed, the control plane's job is done. From this point forward, the ASIC handles every forwarding decision entirely in hardware at line rate, with zero involvement from the switch CPU.
+
+> For a detailed look at how this pipeline works in SONiC, see [The BGP Container and FRR](https://github.com/ManiAm/sonic-lab-internals/blob/master/docs/14_bgp_container.md).
 
 
 ## What is a Network Flow?
@@ -37,7 +39,9 @@ To understand how the hardware load-balances traffic, we first must understand h
 - Destination Port
 - Protocol (e.g., TCP or UDP)
 
-If a stream of packets shares the exact same 5-tuple, the switch knows they belong to the exact same conversation. Crucially, packets within the same flow must be sent down the exact same physical path. If they are split across different links, variations in network latency could cause them to arrive out of order, crippling application performance.
+If a stream of packets shares the exact same 5-tuple, the switch knows they belong to the exact same conversation.
+
+### Mice and Elephant Flows
 
 Network flows in a data center generally fall into two categories:
 
@@ -48,7 +52,9 @@ Network flows in a data center generally fall into two categories:
 
 ## ECMP (Equal-Cost Multi-Pathing)
 
-ECMP is the standard data-plane load-balancing mechanism in IP fabrics. It ensures that aggregate traffic is distributed across all available links, while strictly keeping individual flows pinned to a single link.
+ECMP is the standard data-plane load-balancing mechanism in IP fabrics. It distributes different flows across all available equal-cost links, but all packets belonging to the same flow are sent down the same path.
+
+> Splitting a flow across different links risks out-of-order delivery — different paths have different latencies, so packets can arrive at the receiver in a different order than they were sent. While transport protocols like TCP can reassemble reordered packets using sequence numbers, excessive reordering triggers duplicate ACKs, spurious retransmissions, and reduced throughput, so keeping a flow on a single path is strongly preferred.
 
 The diagram below illustrates ECMP distributing traffic on a per-flow basis. Each colored square represents an individual packet, with each distinct color representing a unique flow. When these packets arrive at the router, the switch sorts each flow into one of the available equal-cost paths. In this example, the router has three available paths, so flows are distributed across three buckets:
 
@@ -58,7 +64,7 @@ The diagram below illustrates ECMP distributing traffic on a per-flow basis. Eac
 
 <img src="../pics/ecmp_example.png" width="650"/>
 
-The Orange and Green flows sharing the same path is an example of a **hash collision**. Because there are nearly infinite flow combinations but only a few physical links, different flows will inevitably map to the same link.
+The Orange and Green flows sharing the same path is an example of a **collision**. Because there are nearly infinite flow combinations but only a few physical links, different flows will inevitably map to the same link.
 
 
 ### Hash-Based Forwarding
@@ -66,16 +72,16 @@ The Orange and Green flows sharing the same path is an example of a **hash colli
 To understand how the ASIC picks a path, follow one packet through the switch:
 
 - **Step 1**: Packet arrives; the ASIC extracts the destination IP.
-- **Step 2**: Routing table (FIB) lookup → the route points to a next-hop group (NHG) with multiple equal-cost members.
+- **Step 2**: Routing table (FIB) lookup → the route points to a **next-hop group (NHG)**. The NHG contains one or more **members**, and each member references a **next hop** (which resolves to an IP address, a router interface, and ultimately an egress port and destination MAC).
 - **Step 3**: The ASIC extracts the 5-tuple and computes a hash over it (the hash output is a wide number, e.g. `0x9C41`).
 - **Step 4**: The hash is reduced to a bucket index: `index = hash mod NHG_size` (e.g. `0x9C41 mod 4 = 1`).
-- **Step 5**: A lookup table (**bucket array**) is read at that index. The entry (**bucket**) points to a specific member (next hop, MAC, egress port).
+- **Step 5**: A lookup table (**bucket array**) is read at that index. The entry (**bucket**) selects a member, and that member's next hop determines the egress port.
 
-The one line to remember: **the hash picks an index; the bucket at that index picks the member.**
+The one line to remember: **the hash picks a bucket; the bucket picks a member; the member's next hop picks the egress port.**
 
 <img src="../pics/ecmp_oper.png" width="800"/>
 
-> **Note:** ECMP hashing does not track how many packets or how much bandwidth has been sent to each next hop. It provides no guarantee that traffic is evenly distributed across all links. Distribution is purely statistical — it depends on the number and size of active flows and how their headers happen to hash. With a large number of **mice flows**, distribution tends to be even. With a small number of **elephant flows** or flows with similar headers, significant imbalance is possible. See [The Elephant Flow Problem](#the-elephant-flow-problem) for a detailed analysis.
+ECMP hashing does not track how many packets or how much bandwidth has been sent to each next hop. It provides no guarantee that traffic is evenly distributed across all links. Distribution is purely statistical — it depends on the number and size of active flows and how their headers happen to hash. With a large number of **mice flows**, distribution tends to be even. With a small number of **elephant flows** or flows with similar headers, significant imbalance is possible. See [The Elephant Flow Problem](#the-elephant-flow-problem) for a detailed analysis.
 
 
 ### Advanced Configuration: Customizing the Hash
@@ -127,13 +133,17 @@ The polarization problem occurs at the second tier. Switch B receives F1 and F2 
 
 The same occurs at Switch C. F3 and F4 both produced hash 1 at Switch A, and Switch C recalculates hash 1 for both. All traffic goes to Switch E. The link from C to D is never used.
 
-Even though 4 equal-cost paths exist between A and F, the identical computation at each hop forces all traffic onto just 2 of them (A → B → D → F and A → C → E → F). The other two cross-links are wasted. Breaking this correlation requires each switch to produce a statistically independent hash result for the same 5-tuple. To achieve this, ASICs use Hash Seeds, Hash Offsets, and specific Hash Algorithms.
+Even though 4 equal-cost paths exist between A and F, the identical computation at each hop forces all traffic onto just 2 of them (A → B → D → F and A → C → E → F). The other two cross-links are wasted. Breaking this correlation requires each switch to produce a statistically independent hash result for the same 5-tuple. To achieve this, ASICs use **Hash Seeds**, **Hash Offsets**, and specific **Hash Algorithms**.
+
+The following diagram shows the ECMP hash pipeline from packet arrival to next-hop selection. An incoming packet's header fields are extracted, fed into a hash algorithm along with a per-switch seed, rotated by a configurable offset, and finally reduced to a bucket index that selects the outgoing next hop. Each of these stages is covered in detail below.
+
+<img src="../pics/hash-calc.png" alt="ECMP hash pipeline" width="700">
 
 #### Hash Seed
 
-The hash seed is a 32-bit integer (0–4,294,967,295) that is mixed into the hash computation before the algorithm processes the packet's 5-tuple fields. It is analogous to a cryptographic salt: feeding the same packet header into the same algorithm, but with a different seed, produces a completely different hash output and therefore a different ECMP member selection.
+The hash seed is a 32-bit integer that is mixed into the hash computation before the algorithm processes the packet's 5-tuple fields. It is analogous to a cryptographic salt: feeding the same packet header into the same algorithm, but with a different seed, produces a completely different hash output and therefore a different ECMP member selection.
 
-Assigning a unique seed per switch is the primary method for preventing hash polarization. With different seeds, the same packet produces a unique hash at each tier, ensuring flows are statistically distributed across the entire fabric.
+Assigning a unique seed per switch is the primary method for preventing hash polarization. The seed is typically a fixed value derived from the switch's role in the fabric — ToR, leaf, and spine switches each receive a different seed at boot time. With different seeds, the same packet produces a unique hash at each tier, ensuring flows are statistically distributed across the entire fabric without requiring the operator to manually configure anything.
 
 #### Hash Offset
 
@@ -141,32 +151,34 @@ The hash offset dictates which bits of the computed hash value are actually used
 
 Even with unique seeds, the same algorithm processing the same 5-tuple can sometimes produce correlated bit patterns across tiers. The offset breaks this subtle correlation by forcing each tier to look at a completely different region of the hash output.
 
-> **Note: Offset vs. Seed**
+> **Offset vs. Seed**
 > Both mechanisms prevent hash polarization, but they work differently. The seed changes the hash computation itself (different input → different output). The offset keeps the hash output the same but extracts different bits for the bucket selection. Using both together provides the strongest anti-polarization across fabric tiers. (The offset has no effect on random or round-robin algorithms, as those do not compute a hash from packet headers).
-
 
 
 ### Hash Algorithms
 
-The hash algorithm determines how the selected header fields and the seed are mathematically combined into the final hash value.
+The hash algorithm determines how the selected header fields and the seed are mathematically combined into the final hash value. SAI defines the following algorithms in its `sai_hash_algorithm_t` enum. Not all ASICs support every algorithm — the switch queries its ASIC at startup to discover which ones are available.
 
-| Algorithm   | Description                                                                                                                                                                                                                                                                        |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| crc         | Standard CRC—the default and most widely used. Provides good distribution across buckets for typical traffic patterns.                                                                                                                                                             |
-| crc-ccitt   | CRC-CCITT variant (polynomial 0x1021). Features slightly different bit-mixing than standard CRC; useful when the default CRC produces uneven distribution for a specific, highly predictable traffic profile.                                                                      |
-| crc-32lo    | Uses the lower 32 bits of a CRC-32 computation. On platforms with wide hash pipelines, this selects the lower half.                                                                                                                                                                |
-| crc-32hi    | Uses the upper 32 bits of a CRC-32 computation. Paired with crc-32lo, these two variants allow a network operator to use different halves of the same CRC calculation for ECMP vs. LAG. This avoids polarization between routing and switching without needing to change the seed. |
-| xor         | Bitwise XOR of the hash fields. It is simpler and faster than CRC but produces weaker distribution. Fields that are numerically close (e.g., sequential IP addresses) tend to map to adjacent buckets.                                                                             |
-| crc-xor     | Hybrid: A CRC calculation followed by an XOR fold. Combines CRC's distribution strength with XOR's ability to compress the result into fewer bits.                                                                                                                                 |
-| random      | Ignores packet headers entirely and selects a bucket at random. Every packet is independently assigned, providing perfect statistical balance but zero flow affinity—packets from the same flow will likely take different paths, causing out-of-order delivery.                   |
-| round-robin | Cycles through buckets sequentially (bucket 0, 1, 2, …, wrap). Like random, this provides no flow affinity and will cause significant packet reordering within flows.                                                                                                              |
-
+| Algorithm | Description |
+|---|---|
+| CRC | Standard CRC — the default and most widely used. Provides good distribution across buckets for typical traffic patterns. |
+| CRC_CCITT | CRC-CCITT variant (polynomial 0x1021). Features slightly different bit-mixing than standard CRC; useful when the default CRC produces uneven distribution for a specific, highly predictable traffic profile. |
+| CRC_32LO | Uses the lower 16 bits of a CRC-32 computation. On platforms with wide hash pipelines, this selects the lower half. |
+| CRC_32HI | Uses the upper 16 bits of a CRC-32 computation. Paired with CRC_32LO, these two variants allow a network operator to use different halves of the same CRC calculation for ECMP vs. LAG. This avoids polarization between routing and switching without needing to change the seed. |
+| XOR | Bitwise XOR of the hash fields. It is simpler and faster than CRC but produces weaker distribution. Fields that are numerically close (e.g., sequential IP addresses) tend to map to adjacent buckets. |
+| CRC_XOR | Hybrid: A CRC calculation followed by an XOR fold. Combines CRC's distribution strength with XOR's ability to compress the result into fewer bits. |
+| RANDOM | Ignores packet headers entirely and selects a bucket at random. Every packet is independently assigned, providing perfect statistical balance but zero flow affinity — packets from the same flow will likely take different paths, causing out-of-order delivery. |
+| ROUND_ROBIN | Cycles through buckets sequentially (bucket 0, 1, 2, …, wrap). Like RANDOM, this provides no flow affinity and will cause significant packet reordering within flows. |
 
 Deployment Recommendations:
 
-- Use `crc` for most deployments to ensure good distribution and flow path consistency.
-- Mix `crc-32lo` and `crc-32hi` across ECMP/LAG with unique seeds for advanced anti-polarization.
-- Avoid `random` and `round-robin` unless the application specifically tolerates packet reordering.
+- Use CRC for most deployments to ensure good distribution and flow path consistency.
+- Mix CRC_32LO and CRC_32HI across ECMP/LAG with unique seeds for advanced anti-polarization.
+- Avoid RANDOM and ROUND_ROBIN unless the application specifically tolerates packet reordering.
+
+> SONiC-specific hash configuration (seed assignment, algorithm selection, and switchorch programming) is covered in [SONiC Load Balancing — Hash Configuration](https://github.com/ManiAm/sonic-lab-internals/blob/master/docs/18_load_balancing.md#hash-configuration).
+
+> For mechanisms that address ECMP's disruption and weighting limitations — resilient hashing, consistent hashing, and weighted ECMP — see [ECMP Variants](02_ECMP_VAR.md).
 
 
 ## The Elephant Flow Problem
@@ -230,8 +242,6 @@ The most congested spine link is expected to carry **10 flows** (2.5× its fair 
 ### The Fundamental Limitation of ECMP
 
 Every mechanism discussed so far — hash tuning, polarization mitigation — improves ECMP but cannot escape its core constraint: **the switch makes forwarding decisions using only local information**. Each switch hashes packet headers and selects a bucket independently, with no knowledge of how much traffic other switches are placing on the same links. When multiple leaf switches independently hash elephant flows onto the same spine link, the result is congestion on that link while parallel links sit idle — and no individual switch can detect or correct this because each one sees only its own egress ports.
-
-> For mechanisms that address ECMP's disruption and weighting limitations — resilient hashing, consistent hashing, and weighted ECMP — see [ECMP Variants](02_ECMP_VAR.md).
 
 This is not a configuration problem. It is an architectural limitation of any system where forwarding decisions are made independently at each hop using only locally available information.
 
