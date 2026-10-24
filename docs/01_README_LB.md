@@ -135,17 +135,20 @@ The same occurs at Switch C. F3 and F4 both produced hash 1 at Switch A, and Swi
 
 Even though 4 equal-cost paths exist between A and F, the identical computation at each hop forces all traffic onto just 2 of them (A → B → D → F and A → C → E → F). The other two cross-links are wasted. Breaking this correlation requires each switch to produce a statistically independent hash result for the same 5-tuple. To achieve this, ASICs use **Hash Seeds**, **Hash Offsets**, and specific **Hash Algorithms**.
 
+
+## The ECMP Hash Pipeline
+
 The following diagram shows the ECMP hash pipeline from packet arrival to next-hop selection. An incoming packet's header fields are extracted, fed into a hash algorithm along with a per-switch seed, rotated by a configurable offset, and finally reduced to a bucket index that selects the outgoing next hop. Each of these stages is covered in detail below.
 
 <img src="../pics/hash-calc.png" alt="ECMP hash pipeline" width="700">
 
-#### Hash Seed
+### Hash Seed
 
 The hash seed is a 32-bit integer that is mixed into the hash computation before the algorithm processes the packet's 5-tuple fields. It is analogous to a cryptographic salt: feeding the same packet header into the same algorithm, but with a different seed, produces a completely different hash output and therefore a different ECMP member selection.
 
 Assigning a unique seed per switch is the primary method for preventing hash polarization. The seed is typically a fixed value derived from the switch's role in the fabric — ToR, leaf, and spine switches each receive a different seed at boot time. With different seeds, the same packet produces a unique hash at each tier, ensuring flows are statistically distributed across the entire fabric without requiring the operator to manually configure anything.
 
-#### Hash Offset
+### Hash Offset
 
 The hash offset dictates which bits of the computed hash value are actually used for the ECMP member selection. After a deterministic hash algorithm (like CRC or XOR) produces a multi-bit result, the ASIC extracts a specific window of bits starting at position offset to determine the final bucket index.
 
