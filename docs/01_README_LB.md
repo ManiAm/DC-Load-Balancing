@@ -179,7 +179,7 @@ Deployment Recommendations:
 - Mix CRC_32LO and CRC_32HI across ECMP/LAG with unique seeds for advanced anti-polarization.
 - Avoid RANDOM and ROUND_ROBIN unless the application specifically tolerates packet reordering.
 
-> SONiC-specific hash configuration (seed assignment, algorithm selection, and switchorch programming) is covered in [SONiC Load Balancing — Hash Configuration](https://github.com/ManiAm/sonic-lab-internals/blob/master/docs/18_load_balancing.md#hash-configuration).
+> SONiC-specific hash configuration (seed assignment, algorithm selection, and switchorch programming) is covered in [SONiC Load Balancing — Hash Configuration](https://github.com/ManiAm/sonic-lab-internals/blob/master/docs/19_load_balancing.md#hash-configuration).
 
 > For mechanisms that address ECMP's disruption and weighting limitations — resilient hashing, consistent hashing, and weighted ECMP — see [ECMP Variants](02_ECMP_VAR.md).
 
